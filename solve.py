@@ -12,6 +12,8 @@ import re
 import sys
 from collections import Counter
 
+import openpyxl
+
 MONTHS = {'янв': 1, 'фев': 2, 'мар': 3, 'апр': 4, 'мая': 5, 'май': 5, 'июн': 6,
           'июл': 7, 'авг': 8, 'сен': 9, 'окт': 10, 'ноя': 11, 'дек': 12}
 
@@ -191,6 +193,88 @@ def q2(lines, bank, notes):
     }
 
 
+def sheet(wb, name, first_col):
+    """Rows of a sheet as dicts, starting from the row whose first cell is first_col."""
+    rows = list(wb[name].iter_rows(values_only=True))
+    head = next(i for i, r in enumerate(rows) if r and str(r[0]).strip() == first_col)
+    cols = [str(c).strip() if c is not None else '' for c in rows[head]]
+    return [dict(zip(cols, r)) for r in rows[head + 1:] if r and r[0] is not None]
+
+
+def as_date(v):
+    if v is None or v == '':
+        return None
+    return v.date() if isinstance(v, dt.datetime) else v if isinstance(v, dt.date) else parse_date(str(v))
+
+
+def name_key(s):
+    return re.sub(r'[\s.]', '', s.lower().replace('ё', 'е'))
+
+
+def q3(lines, wb, notes):
+    renames = {r['Старый артикул'].strip(): r['Новый артикул'].strip() for r in sheet(wb, 'Переименования', 'Старый артикул')}
+    prices = {}
+    for r in sheet(wb, 'Прайс_история', 'Артикул'):
+        prices.setdefault(r['Артикул'].strip(), []).append(
+            (as_date(r['Действует с']), as_date(r['Действует по']), float(r['Минимально допустимая цена, ₽'])))
+    managers = {}
+    for r in sheet(wb, 'Менеджеры', 'Каноническое имя'):
+        for v in [r['Каноническое имя']] + str(r['Варианты написания в CRM'] or '').split('|'):
+            managers[name_key(v)] = r['Каноническое имя'].strip()
+
+    created = {}
+    for l in lines:
+        created.setdefault(l['order'], set()).add(l['created'])
+    odd = {o: sorted(d) for o, d in created.items() if len(d) > 1}
+    log(f'Q3: orders whose lines have different creation dates: {len(odd)} {odd if odd else ""}')
+    created = {o: min(d) for o, d in created.items()}  # shortcut: earliest date if lines disagree (none do today)
+
+    unknown_mgr, no_period, viol = Counter(), Counter(), []
+    renamed = 0
+    for l in lines:
+        if l['status'] == 'Отменён':
+            continue
+        sku = l['sku']
+        while sku in renames:
+            sku = renames[sku]
+        renamed += sku != l['sku']
+        day = created[l['order']]
+        period = next(((a, b, p) for a, b, p in prices.get(sku, []) if a <= day and (b is None or day <= b)), None)
+        if period is None:
+            no_period[sku] += 1
+            continue
+        gross = l['price'] * l['qty']
+        d = l['discount_raw']
+        disc = gross * money(d[:-1]) / 100 if d.endswith('%') else money(d) if d else 0.0
+        unit = (gross - disc) / l['qty']
+        if unit < period[2] - 1e-6:
+            mgr = managers.get(name_key(l['manager_raw']))
+            if mgr is None:
+                unknown_mgr[l['manager_raw']] += 1
+                mgr = l['manager_raw'].strip()
+            viol.append([l['order'], l['line'], day, l['sku'], sku, l['qty'], l['price'], d, rub(disc),
+                         round(unit, 2), period[2], period[0], period[1] or '', mgr])
+    if no_period:
+        log(f'Q3 WARNING: lines with no price period for their SKU/date, skipped: {dict(no_period)}')
+    if unknown_mgr:
+        log(f'Q3 WARNING: manager spellings not in the reference, kept as is: {dict(unknown_mgr)}')
+    counts = Counter(v[-1] for v in viol)
+    by_mgr = {m: counts[m] for m in sorted(set(managers.values()) | set(counts))}  # zeros included: full breakdown
+    header = ['заказ', 'строка', 'дата заказа', 'артикул в CRM', 'артикул в прайсе', 'кол-во', 'цена за ед.',
+              'скидка', 'скидка, руб', 'цена за ед. после скидки', 'мин. цена', 'период с', 'период по', 'менеджер']
+    path = write_check('q3_violations.csv', header, viol)
+    log(f'Q3: non-cancelled lines checked {sum(l["status"] != "Отменён" for l in lines)}, '
+        f'old SKUs mapped to new {renamed}; violations {len(viol)} by manager {by_mgr} (all: {path})')
+    for v in viol[:5]:
+        log('   ' + '; '.join(f'{h}={x}' for h, x in zip(header, v)))
+    notes.append('Q3: старый артикул всегда заменяю на новый (в «Прайс_история» есть только новые), независимо от даты перехода. '
+                 'Дата заказа — одна на заказ (из оставленных строк); границы периодов цен включительно, пустое «Действует по» — бессрочно. '
+                 'Цена за ед. после скидки = (Цена × Кол-во − скидка) / Кол-во; нарушение — строго ниже минимальной. '
+                 'Строки «Отменён» исключены, «Возврат» и «В работе» учитываются. Менеджер — по справочнику, '
+                 'нарушения уволившейся Полины Орловой считаются на неё.')
+    return {'q3_price_violation_lines_total': len(viol), 'q3_price_violation_lines_by_manager': by_mgr}
+
+
 def main(data_dir):
     notes = []
     raw_rows, lines = load_lines(find(data_dir, '01_'))
@@ -209,6 +293,7 @@ def main(data_dir):
         'q1_unique_order_lines': len(lines),
     })
     answers.update(q2(lines, load_bank(find(data_dir, '02_')), notes))
+    answers.update(q3(lines, openpyxl.load_workbook(find(data_dir, '03_'), read_only=True), notes))
     answers['run_command'] = 'python solve.py data/ > answers.json'
     answers['notes'] = ' '.join(notes)
     json.dump(answers, sys.stdout, ensure_ascii=False, indent=1)
