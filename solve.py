@@ -140,6 +140,12 @@ def rub(x):
     return int(x) if x == int(x) else x
 
 
+def discount(l):
+    """'N%' is a percent of Цена × Кол-во; a plain number is roubles off the whole line."""
+    gross, d = l['price'] * l['qty'], l['discount_raw']
+    return gross * money(d[:-1]) / 100 if d.endswith('%') else money(d) if d else 0.0
+
+
 def q2(lines, bank, notes):
     orders = {l['order'] for l in lines}
     statuses = {}
@@ -182,8 +188,19 @@ def q2(lines, bank, notes):
     if abs(total - total_int) > 0.005:
         log(f'Q2b WARNING: sum {total:.2f} has kopecks, rounded to {total_int} for the int answer')
     log(f'Q2b: unidentified incoming payments {len(unident)}, sum {total_int}')
+    totals, created = Counter(), {}
+    for l in lines:
+        totals[l['order']] += l['price'] * l['qty'] - discount(l)
+        created[l['order']] = l['created']
     for b in unident:
-        log(f'   {b["Дата операции"]}  {b["Сумма"]:>14}  {b["Назначение платежа"]}')
+        same = [o for o in q2a if abs(totals[o] - money(b['Сумма'])) < 1]  # amount equals a Q2a order total
+        log(f'   {b["Дата операции"]}  {b["Сумма"]:>14}  {b["Назначение платежа"]}'
+            + (f'   <-- amount equals total of Q2a order {same}' if same else ''))
+        for o in same:
+            pay_day = parse_date(b['Дата операции'])
+            notes.append(f'Q2: неопознанный платёж {b["Сумма"]} ₽ от {b["Дата операции"]} («{b["Назначение платежа"]}») '
+                         f'по сумме совпадает с заказом {o} из Q2a, но по правилу ТЗ остаётся неопознанным'
+                         + (f', тем более заказ создан позже, {created[o]:%d.%m.%Y}.' if created[o] > pay_day else '.'))
     by_shape = Counter(re.sub(r'\d+', '9', r[2]) for r in unread)
     path = write_check('q2_unread_numbers.csv', ['дата', 'сумма', 'назначение', 'прочитан номер заказа', 'прочие числа'], unread)
     log(f'Q2: {len(unread)} purposes contain numbers not read as an order number (full list: {path}):')
@@ -252,10 +269,9 @@ def q3(lines, wb, notes):
         if period is None:
             no_period[sku] += 1
             continue
-        gross = l['price'] * l['qty']
         d = l['discount_raw']
-        disc = gross * money(d[:-1]) / 100 if d.endswith('%') else money(d) if d else 0.0
-        unit = (gross - disc) / l['qty']
+        disc = discount(l)
+        unit = (l['price'] * l['qty'] - disc) / l['qty']
         if unit < period[2] - 1e-6:
             mgr = managers.get(name_key(l['manager_raw']))
             if mgr is None:
