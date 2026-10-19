@@ -52,5 +52,8 @@ q4 = answers['q4_chats_meeting_before_price']
 assert all(type(c) is str and c[0] == 'C' for c in q4) and q4 == sorted(q4, key=solve.chat_no)  # template: «C0001»
 assert type(answers['run_command']) is str
 assert type(answers['notes']) is str and answers['notes'] != template['notes']
-assert 'Марина Котова — 0 нарушений, поэтому в разбивку не включена' in answers['notes']
+import openpyxl
+canon = {r['Каноническое имя'].strip() for r in solve.sheet(openpyxl.load_workbook(solve.find('data/', '03_')), 'Менеджеры', 'Каноническое имя')}
+for m in canon - set(by_mgr):
+    assert f'{m} — 0 нарушений, поэтому в разбивку не включена' in answers['notes'], m
 print('answers format ok')
