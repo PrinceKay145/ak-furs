@@ -6,11 +6,16 @@ Answers go to stdout; sanity counts go to stderr.
 import csv
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import time
+import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import openpyxl
 
@@ -275,6 +280,151 @@ def q3(lines, wb, notes):
     return {'q3_price_violation_lines_total': len(viol), 'q3_price_violation_lines_by_manager': by_mgr}
 
 
+def load_chats(path):
+    """{chat_id: [(role, text), ...]} read straight from the zip; role is 'manager' or 'client'."""
+    chats = {}
+    with zipfile.ZipFile(path) as z:
+        for name in sorted(z.namelist()):
+            if not name.endswith('.txt') or '__MACOSX' in name:
+                continue
+            text = z.read(name).decode('utf-8-sig')
+            head, *body = text.splitlines()
+            m = re.search(r'C\d+', head)
+            cid = m.group() if m else os.path.splitext(os.path.basename(name))[0]
+            msgs = []
+            for line in body:
+                m = re.match(r'\[[^\]]*\]\s*([^:]+):\s*(.*)', line)
+                if m:
+                    msgs.append(['manager' if m[1].strip().lower().startswith('менедж') else 'client', m[2]])
+                elif line.strip() and msgs:
+                    msgs[-1][1] += '\n' + line  # message continued on the next line
+            chats[cid] = [tuple(x) for x in msgs]
+    return chats
+
+
+# Regex detector, used to check the LLM and as its fallback.
+PRICE_RE = re.compile(r'\d[\d\s.,]*\s*(?:тыс|млн|₽|руб|р\.)|\b\d{1,3}(?:[ .\xa0]\d{3})+\b|\b\d{5,}\b|тысяч|миллион', re.I)
+INVITE_RE = re.compile(r'примерк|приезжа|подъех|приглаша|запиш|встреч|заезжа|приходи|жд[её]м вас', re.I)
+
+
+def regex_labels(msgs):
+    return {'price': [i for i, (r, t) in enumerate(msgs, 1) if r == 'manager' and PRICE_RE.search(t)],
+            'invite': [i for i, (r, t) in enumerate(msgs, 1) if r == 'manager' and INVITE_RE.search(t)]}
+
+
+LLM_PROMPT = '''Ниже переписка менеджера ателье меховых изделий с клиентом. Сообщения пронумерованы.
+Для каждого сообщения МЕНЕДЖЕРА определи две метки.
+
+price — менеджер называет клиенту стоимость изделия в деньгах: цифрами или прописью («53 000 ₽», «2,4 млн»,
+«двести тысяч рублей»), включая «от 300 тыс.», начальную, итоговую или скидочную цену, а также когда менеджер
+повторяет или подтверждает сумму, названную клиентом («да, 450 тысяч»).
+НЕ price: проценты (предоплата 30%), число платежей, время, часы работы, даты, размеры, адрес.
+
+invite — менеджер приглашает клиента приехать: на встречу, примерку, в шоурум или ателье; предлагает записать;
+спрашивает, когда клиент сможет приехать.
+НЕ invite: только адрес или часы работы без приглашения, рассказ об ателье.
+
+Сообщения клиента не размечай. Верни номера сообщений для каждой метки (пустой список, если нет).
+
+<chat>
+{chat}
+</chat>'''
+LLM_SCHEMA = json.dumps({'type': 'object', 'required': ['price', 'invite'], 'properties': {
+    'price': {'type': 'array', 'items': {'type': 'integer'}},
+    'invite': {'type': 'array', 'items': {'type': 'integer'}}}})
+LLM_CMD = ['claude', '-p', '--model', 'sonnet', '--output-format', 'json', '--json-schema', LLM_SCHEMA,
+           '--tools', '', '--strict-mcp-config', '--no-session-persistence',
+           '--settings', '{"disableAllHooks": true}',
+           '--system-prompt', 'Ты размечаешь сообщения переписки. Отвечай только по JSON-схеме.']
+CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'llm_cache.json')
+
+
+def llm_labels(msgs):
+    chat = '\n'.join(f'{i}. {"Менеджер" if r == "manager" else "Клиент"}: {t}' for i, (r, t) in enumerate(msgs, 1))
+    out = subprocess.run(LLM_CMD, input=LLM_PROMPT.format(chat=chat), capture_output=True, text=True, timeout=180)
+    if out.returncode:
+        raise RuntimeError(f'claude exit {out.returncode}: {(out.stderr or out.stdout)[-300:]}')
+    res = json.loads(out.stdout)
+    labels = res.get('structured_output') or json.loads(res['result'])
+    return {k: sorted({int(i) for i in labels[k]}) for k in ('price', 'invite')}
+
+
+def all_llm_labels(chats):
+    """LLM labels per chat: cached by chat-text hash, else 8 parallel `claude -p` calls, else regex fallback."""
+    try:
+        cache = json.load(open(CACHE, encoding='utf-8'))
+    except FileNotFoundError:
+        cache = {}
+    key = {cid: hashlib.sha256((LLM_PROMPT + repr(m)).encode()).hexdigest() for cid, m in chats.items()}
+    todo = [cid for cid in chats if key[cid] not in cache]
+    labels, failed, errors = {cid: cache[key[cid]] for cid in chats if key[cid] in cache}, [], set()
+    log(f'Q4: {len(chats)} chats, {len(labels)} from LLM cache, {len(todo)} to send to `claude -p`')
+    if todo:
+        start = time.time()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {cid: pool.submit(llm_labels, chats[cid]) for cid in todo}
+            for cid, f in futures.items():
+                try:
+                    labels[cid] = cache[key[cid]] = f.result()
+                except Exception as e:  # CLI missing, timeout, bad JSON: use regex for this chat
+                    failed.append(cid)
+                    labels[cid] = regex_labels(chats[cid])
+                    if str(e) not in errors:  # same error for every chat when the CLI is missing: say it once
+                        errors.add(str(e))
+                        log(f'Q4 WARNING: LLM failed for {cid}, using regex detector: {e}')
+        log(f'Q4: LLM calls took {time.time() - start:.0f}s for {len(todo)} chats')
+        json.dump(cache, open(CACHE, 'w', encoding='utf-8'), indent=0, sort_keys=True)
+    if failed:
+        log(f'Q4 WARNING: {len(failed)} chats fell back to regex: {failed}')
+    return labels, failed
+
+
+def meeting_before_price(msgs, labels):
+    """First manager invitation comes before the first manager price (or no price at all)."""
+    manager = {i for i, (r, _) in enumerate(msgs, 1) if r == 'manager'}
+    price = min((i for i in labels['price'] if i in manager), default=None)
+    invite = min((i for i in labels['invite'] if i in manager), default=None)
+    return invite is not None and (price is None or invite < price)
+
+
+def show_chat(cid, msgs, labels):
+    out = [f'--- {cid}: meeting before price = {meeting_before_price(msgs, labels)}']
+    for i, (r, t) in enumerate(msgs, 1):
+        tags = ''.join(f' [{k}]' for k in ('price', 'invite') if i in labels[k])
+        out.append(f'  {i:2}. {"М" if r == "manager" else "К"}: {t}{tags}')
+    return '\n'.join(out)
+
+
+def q4(chats, notes):
+    llm, failed = all_llm_labels(chats)
+    flagged = sorted(cid for cid in chats if meeting_before_price(chats[cid], llm[cid]))
+    rx = {cid: regex_labels(m) for cid, m in chats.items()}
+    rx_flagged = sorted(cid for cid in chats if meeting_before_price(chats[cid], rx[cid]))
+    label_diff = [cid for cid in chats if llm[cid] != rx[cid] and cid not in failed]
+    verdict_diff = sorted(set(flagged) ^ set(rx_flagged))
+    log(f'Q4: meeting before price (LLM): {len(flagged)} chats; regex detector: {len(rx_flagged)}')
+    log(f'Q4: LLM vs regex: labels differ in {len(label_diff)} chats, final answer differs in {len(verdict_diff)}: {verdict_diff}')
+    details = []
+    for cid in label_diff:
+        details.append(show_chat(cid, chats[cid], llm[cid]) + f'\n  regex: {rx[cid]}  llm: {llm[cid]}')
+        log(f'   {cid}: llm {llm[cid]}  regex {rx[cid]}' + ('  <-- answer differs' if cid in verdict_diff else ''))
+    os.makedirs('checks', exist_ok=True)
+    open('checks/q4_disagreements.txt', 'w', encoding='utf-8').write('\n\n'.join(details) + '\n')
+    sample = flagged[:3] + [c for c in chats if c not in flagged][:2]
+    log('Q4: 5 chats to check by eye (М = менеджер, К = клиент):')
+    for cid in sample:
+        log(show_chat(cid, chats[cid], llm[cid]))
+    notes.append(f'Q4: LLM (claude -p, Sonnet) только размечает сообщения менеджера: где названа цена и где приглашение; '
+                 f'порядок решает код. Чат в ответе, если первое приглашение менеджера раньше первой названной им цены '
+                 f'или цена не названа вовсе (как в C0010); без приглашения — не нарушение; цена и приглашение в одном '
+                 f'сообщении — не нарушение. Суммы клиента не считаются; подтверждение менеджером суммы клиента и «от N» — '
+                 f'считаются ценой. Проверка: независимый regex-детектор, расхождения разметки в {len(label_diff)} '
+                 f'из {len(chats) - len(failed)} чатов, итог расходится в {len(verdict_diff)}' +
+                 (f' ({", ".join(verdict_diff)})' if verdict_diff else '') + '.' +
+                 (f' Для {len(failed)} чатов LLM недоступна, использован regex.' if failed else ''))
+    return {'q4_chats_meeting_before_price': flagged}
+
+
 def main(data_dir):
     notes = []
     raw_rows, lines = load_lines(find(data_dir, '01_'))
@@ -294,6 +444,7 @@ def main(data_dir):
     })
     answers.update(q2(lines, load_bank(find(data_dir, '02_')), notes))
     answers.update(q3(lines, openpyxl.load_workbook(find(data_dir, '03_'), read_only=True), notes))
+    answers.update(q4(load_chats(find(data_dir, '04_')), notes))
     answers['run_command'] = 'python solve.py data/ > answers.json'
     answers['notes'] = ' '.join(notes)
     json.dump(answers, sys.stdout, ensure_ascii=False, indent=1)
