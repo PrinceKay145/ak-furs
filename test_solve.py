@@ -31,3 +31,22 @@ assert solve.meeting_before_price([('manager', 'a')], {'price': [], 'invite': [1
 assert not solve.meeting_before_price([('manager', 'a')], {'price': [1], 'invite': [1]})   # same message
 assert solve.meeting_before_price([('client', 'a'), ('manager', 'b')], {'price': [1], 'invite': [2]})  # client's price ignored
 print('q4 detector ok')
+
+# answers.json must match answers_template.json: same keys in the same order, and the types the template asks for
+import json, subprocess, sys
+template = json.load(open('data/answers_template.json', encoding='utf-8'))
+out = subprocess.run([sys.executable, 'solve.py', 'data/'], capture_output=True, text=True, check=True).stdout
+answers = json.loads(out)
+assert list(answers) == list(template), (list(answers), list(template))
+num = (int, float)
+assert type(answers['q1_unique_orders']) is int and type(answers['q1_unique_order_lines']) is int
+assert all(type(o) is int for o in answers['q2a_paid_orders_without_payment'])  # template: «номера заказов числами»
+assert type(answers['q2b_unidentified_payments_count']) is int
+assert isinstance(answers['q2b_unidentified_payments_sum_rub'], num) and not isinstance(answers['q2b_unidentified_payments_sum_rub'], bool)
+assert type(answers['q3_price_violation_lines_total']) is int
+by_mgr = answers['q3_price_violation_lines_by_manager']
+assert all(type(k) is str and type(v) is int for k, v in by_mgr.items())
+assert sum(by_mgr.values()) == answers['q3_price_violation_lines_total']
+assert all(type(c) is str and c[0] == 'C' for c in answers['q4_chats_meeting_before_price'])  # template: «C0001»
+assert type(answers['run_command']) is str and type(answers['notes']) is str and answers['notes'] != template['notes']
+print('answers format ok')
