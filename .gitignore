@@ -1,0 +1,4 @@
+.DS_Store
+__pycache__/
+# training data: the brief asks not to publish it
+data/
