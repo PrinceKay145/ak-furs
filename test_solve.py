@@ -38,15 +38,19 @@ template = json.load(open('data/answers_template.json', encoding='utf-8'))
 out = subprocess.run([sys.executable, 'solve.py', 'data/'], capture_output=True, text=True, check=True).stdout
 answers = json.loads(out)
 assert list(answers) == list(template), (list(answers), list(template))
-num = (int, float)
 assert type(answers['q1_unique_orders']) is int and type(answers['q1_unique_order_lines']) is int
-assert all(type(o) is int for o in answers['q2a_paid_orders_without_payment'])  # template: «номера заказов числами»
+q2a = answers['q2a_paid_orders_without_payment']
+assert all(type(o) is int for o in q2a) and q2a == sorted(q2a)  # template: «номера заказов числами»
 assert type(answers['q2b_unidentified_payments_count']) is int
-assert isinstance(answers['q2b_unidentified_payments_sum_rub'], num) and not isinstance(answers['q2b_unidentified_payments_sum_rub'], bool)
+assert type(answers['q2b_unidentified_payments_sum_rub']) is int
 assert type(answers['q3_price_violation_lines_total']) is int
 by_mgr = answers['q3_price_violation_lines_by_manager']
 assert all(type(k) is str and type(v) is int for k, v in by_mgr.items())
 assert sum(by_mgr.values()) == answers['q3_price_violation_lines_total']
-assert all(type(c) is str and c[0] == 'C' for c in answers['q4_chats_meeting_before_price'])  # template: «C0001»
-assert type(answers['run_command']) is str and type(answers['notes']) is str and answers['notes'] != template['notes']
+assert all(v > 0 for v in by_mgr.values())  # managers with 0 violations are left out (and named in notes)
+q4 = answers['q4_chats_meeting_before_price']
+assert all(type(c) is str and c[0] == 'C' for c in q4) and q4 == sorted(q4, key=solve.chat_no)  # template: «C0001»
+assert type(answers['run_command']) is str
+assert type(answers['notes']) is str and answers['notes'] != template['notes']
+assert 'Марина Котова — 0 нарушений, поэтому в разбивку не включена' in answers['notes']
 print('answers format ok')

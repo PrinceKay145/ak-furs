@@ -172,14 +172,16 @@ def q2(lines, bank, notes):
     q2a, q2a_all = answer(paid_any), answer(paid_all)
     total = sum(money(b['Сумма']) for b in unident)
     log(f'Q2a: paid orders without any incoming payment: {len(q2a)} -> {q2a}')
+    notes.append('Q2a: заказ «Оплачен», если хотя бы одна его неотменённая строка «Оплачен».')
     if q2a != q2a_all:
         log(f'Q2a: with the all-lines rule the answer would be {len(q2a_all)} -> {q2a_all}')
-        notes.append(f'Q2a: заказ считаю «Оплачен», если хотя бы одна неотменённая строка «Оплачен». '
-                     f'Если требовать «Оплачен» у всех строк, ответ другой: {q2a_all}.')
+        notes.append(f'Q2a: если требовать «Оплачен» у всех строк, ответ другой: {", ".join(map(str, q2a_all))}.')
     else:
-        notes.append(f'Q2a: заказ считаю «Оплачен», если хотя бы одна неотменённая строка «Оплачен» '
-                     f'(правило «все строки Оплачен» даёт тот же ответ: смешанных статусов в заказах {mixed}).')
-    log(f'Q2b: unidentified incoming payments {len(unident)}, sum {rub(total)}')
+        notes.append('Q2a: правило «все строки Оплачен» даёт тот же ответ.')
+    total_int = round(total)
+    if abs(total - total_int) > 0.005:
+        log(f'Q2b WARNING: sum {total:.2f} has kopecks, rounded to {total_int} for the int answer')
+    log(f'Q2b: unidentified incoming payments {len(unident)}, sum {total_int}')
     for b in unident:
         log(f'   {b["Дата операции"]}  {b["Сумма"]:>14}  {b["Назначение платежа"]}')
     by_shape = Counter(re.sub(r'\d+', '9', r[2]) for r in unread)
@@ -187,14 +189,14 @@ def q2(lines, bank, notes):
     log(f'Q2: {len(unread)} purposes contain numbers not read as an order number (full list: {path}):')
     for shape, n in by_shape.most_common():
         log(f'   {n:4}  {shape}')
-    notes.append('Q2: платёж опознан, если в назначении есть номер существующего заказа (в т.ч. отменённого): '
-                 '«A877», «А-00391», «зак. 528», «заказ 775», а также «Счёт №/по счету №N» — номер счёта считаю '
-                 'номером заказа (суммы таких платежей совпадают с суммами заказов так же часто, как у «Оплата заказа»). '
-                 'Телефоны и даты в назначении игнорируются. Списания (возвраты) не считаются поступлениями.')
+    notes += ['Q2: платёж опознан, если в назначении есть номер существующего заказа, в том числе отменённого.',
+              'Q2: номер в «Счёт № N» и «по счету №N» считаю номером заказа: суммы таких платежей совпадают с суммами заказов.',
+              'Q2: телефоны и даты в назначении платежа не считаю номерами заказов.',
+              'Q2: списания (возвраты) не считаю поступлениями.']
     return {
         'q2a_paid_orders_without_payment': q2a,
         'q2b_unidentified_payments_count': len(unident),
-        'q2b_unidentified_payments_sum_rub': rub(total),
+        'q2b_unidentified_payments_sum_rub': total_int,
     }
 
 
@@ -222,8 +224,10 @@ def q3(lines, wb, notes):
     for r in sheet(wb, 'Прайс_история', 'Артикул'):
         prices.setdefault(r['Артикул'].strip(), []).append(
             (as_date(r['Действует с']), as_date(r['Действует по']), float(r['Минимально допустимая цена, ₽'])))
-    managers = {}
+    managers, fired = {}, {}
     for r in sheet(wb, 'Менеджеры', 'Каноническое имя'):
+        if as_date(r.get('Дата увольнения')):
+            fired[r['Каноническое имя'].strip()] = as_date(r['Дата увольнения'])
         for v in [r['Каноническое имя']] + str(r['Варианты написания в CRM'] or '').split('|'):
             managers[name_key(v)] = r['Каноническое имя'].strip()
 
@@ -264,7 +268,8 @@ def q3(lines, wb, notes):
     if unknown_mgr:
         log(f'Q3 WARNING: manager spellings not in the reference, kept as is: {dict(unknown_mgr)}')
     counts = Counter(v[-1] for v in viol)
-    by_mgr = {m: counts[m] for m in sorted(set(managers.values()) | set(counts))}  # zeros included: full breakdown
+    by_mgr = dict(sorted(counts.items()))
+    zero = sorted(set(managers.values()) - set(counts))
     header = ['заказ', 'строка', 'дата заказа', 'артикул в CRM', 'артикул в прайсе', 'кол-во', 'цена за ед.',
               'скидка', 'скидка, руб', 'цена за ед. после скидки', 'мин. цена', 'период с', 'период по', 'менеджер']
     path = write_check('q3_violations.csv', header, viol)
@@ -272,11 +277,18 @@ def q3(lines, wb, notes):
         f'old SKUs mapped to new {renamed}; violations {len(viol)} by manager {by_mgr} (all: {path})')
     for v in viol[:5]:
         log('   ' + '; '.join(f'{h}={x}' for h, x in zip(header, v)))
-    notes.append('Q3: старый артикул всегда заменяю на новый (в «Прайс_история» есть только новые), независимо от даты перехода. '
-                 'Дата заказа — одна на заказ (из оставленных строк); границы периодов цен включительно, пустое «Действует по» — бессрочно. '
-                 'Цена за ед. после скидки = (Цена × Кол-во − скидка) / Кол-во; нарушение — строго ниже минимальной. '
-                 'Строки «Отменён» исключены, «Возврат» и «В работе» учитываются. Менеджер — по справочнику, '
-                 'нарушения уволившейся Полины Орловой считаются на неё.')
+    notes += ['Q3: старый артикул всегда заменяю на новый, независимо от даты перехода: в «Прайс_история» есть только новые.',
+              'Q3: дата заказа одна на заказ; границы периодов цен включительно, пустое «Действует по» — без конца.',
+              'Q3: цена за единицу после скидки = (Цена × Кол-во − скидка) / Кол-во; нарушение — строго ниже минимальной.',
+              'Q3: исключены только строки «Отменён»; «Возврат» и «В работе» учитываются.',
+              ]
+    for m, day in sorted(fired.items()):
+        before = sum(1 for v in viol if v[-1] == m and v[2] <= day)
+        after = sum(1 for v in viol if v[-1] == m and v[2] > day)
+        log(f'Q3: {m} left {day}: violations on orders created before/on {before}, after {after}')
+        notes.append(f'Q3: нарушения уволившегося менеджера ({m}, {day:%d.%m.%Y}) считаю на него: '
+                     f'{before} по заказам до увольнения, {after} — после.')
+    notes += [f'Q3: {m} — 0 нарушений, поэтому в разбивку не включена.' for m in zero]
     return {'q3_price_violation_lines_total': len(viol), 'q3_price_violation_lines_by_manager': by_mgr}
 
 
@@ -395,9 +407,13 @@ def show_chat(cid, msgs, labels):
     return '\n'.join(out)
 
 
+def chat_no(cid):
+    return int(re.sub(r'\D', '', cid) or 0)
+
+
 def q4(chats, notes):
     llm, failed = all_llm_labels(chats)
-    flagged = sorted(cid for cid in chats if meeting_before_price(chats[cid], llm[cid]))
+    flagged = sorted((cid for cid in chats if meeting_before_price(chats[cid], llm[cid])), key=chat_no)
     rx = {cid: regex_labels(m) for cid, m in chats.items()}
     rx_flagged = sorted(cid for cid in chats if meeting_before_price(chats[cid], rx[cid]))
     label_diff = [cid for cid in chats if llm[cid] != rx[cid] and cid not in failed]
@@ -414,14 +430,16 @@ def q4(chats, notes):
     log('Q4: 5 chats to check by eye (М = менеджер, К = клиент):')
     for cid in sample:
         log(show_chat(cid, chats[cid], llm[cid]))
-    notes.append(f'Q4: LLM (claude -p, Sonnet) только размечает сообщения менеджера: где названа цена и где приглашение; '
-                 f'порядок решает код. Чат в ответе, если первое приглашение менеджера раньше первой названной им цены '
-                 f'или цена не названа вовсе (как в C0010); без приглашения — не нарушение; цена и приглашение в одном '
-                 f'сообщении — не нарушение. Суммы клиента не считаются; подтверждение менеджером суммы клиента и «от N» — '
-                 f'считаются ценой. Проверка: независимый regex-детектор, расхождения разметки в {len(label_diff)} '
-                 f'из {len(chats) - len(failed)} чатов, итог расходится в {len(verdict_diff)}' +
-                 (f' ({", ".join(verdict_diff)})' if verdict_diff else '') + '.' +
-                 (f' Для {len(failed)} чатов LLM недоступна, использован regex.' if failed else ''))
+    notes += ['Q4: LLM (claude -p, Sonnet) только отмечает сообщения менеджера с ценой и с приглашением, порядок проверяет код.',
+              'Q4: чат в ответе, если первое приглашение менеджера раньше первой названной им цены.',
+              'Q4: если менеджер пригласил, а цену так и не назвал (как в C0010), чат тоже в ответе.',
+              'Q4: чат без приглашения и чат, где цена и приглашение в одном сообщении, нарушением не считаю.',
+              'Q4: суммы, названные клиентом, ценой не считаю; подтверждение такой суммы менеджером и «от N» — считаю.',
+              f'Q4: проверка независимым regex-детектором: разметка расходится в {len(label_diff)} из '
+              f'{len(chats) - len(failed)} чатов, итоговый ответ — в {len(verdict_diff)}'
+              + (f' ({", ".join(verdict_diff)}).' if verdict_diff else '.')]
+    if failed:
+        notes.append(f'Q4: для {len(failed)} чатов LLM была недоступна, использован regex-детектор.')
     return {'q4_chats_meeting_before_price': flagged}
 
 
@@ -433,9 +451,11 @@ def main(data_dir):
         f'dropped duplicates {len(raw_rows) - len(lines)}, unique orders {len(orders)} '
         f'(numbers {min(orders)}..{max(orders)})')
     log('Q1: statuses per line', dict(Counter(l['status'] for l in lines)))
-    notes.append('Q1: номер заказа — цифры из поля; дубли по (заказ, № строки) — берётся строка с последним «Выгружено». '
-                 'Даты вида 11/02/2025 читаю как ДД/ММ (первое число доходит до 31). '
-                 'Статусы: NEW, «Ждём оплату» и прочее -> «В работе»; статус берётся только из поля «Статус», не из комментария.')
+    notes += ['Q1: номер заказа — цифры из поля, буква и ведущие нули отбрасываются.',
+              'Q1: из дублей пары «заказ + № строки» беру строку с самым поздним «Выгружено».',
+              'Q1: даты вида 11/02/2025 читаю как ДД/ММ, потому что первое число доходит до 31.',
+              'Q1: NEW, «Ждём оплату» и прочие статусы считаю «В работе».',
+              'Q1: статус беру только из поля «Статус», комментарий («клиент вернул») не учитываю.']
 
     answers = json.load(open(find(data_dir, 'answers_template')))
     answers.update({
