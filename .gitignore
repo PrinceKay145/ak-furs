@@ -4,3 +4,4 @@ __pycache__/
 data/
 # eye-check dumps, contain data rows
 checks/
+.venv/
