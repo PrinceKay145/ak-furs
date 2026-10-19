@@ -2,3 +2,5 @@
 __pycache__/
 # training data: the brief asks not to publish it
 data/
+# eye-check dumps, contain data rows
+checks/
