@@ -256,6 +256,7 @@ def q3(lines, wb, notes):
     created = {o: min(d) for o, d in created.items()}  # shortcut: earliest date if lines disagree (none do today)
 
     unknown_mgr, no_period, viol = Counter(), Counter(), []
+    below = 0.0  # roubles below the minimum price, summed over violating lines
     renamed = 0
     for l in lines:
         if l['status'] == 'Отменён':
@@ -277,6 +278,7 @@ def q3(lines, wb, notes):
             if mgr is None:
                 unknown_mgr[l['manager_raw']] += 1
                 mgr = l['manager_raw'].strip()
+            below += (period[2] - unit) * l['qty']
             viol.append([l['order'], l['line'], day, l['sku'], sku, l['qty'], l['price'], d, rub(disc),
                          round(unit, 2), period[2], period[0], period[1] or '', mgr])
     if no_period:
@@ -290,7 +292,8 @@ def q3(lines, wb, notes):
               'скидка', 'скидка, руб', 'цена за ед. после скидки', 'мин. цена', 'период с', 'период по', 'менеджер']
     path = write_check('q3_violations.csv', header, viol)
     log(f'Q3: non-cancelled lines checked {sum(l["status"] != "Отменён" for l in lines)}, '
-        f'old SKUs mapped to new {renamed}; violations {len(viol)} by manager {by_mgr} (all: {path})')
+        f'old SKUs mapped to new {renamed}; violations {len(viol)} by manager {by_mgr}, '
+        f'{round(below):,} ₽ below minimum in total (all: {path})')
     for v in viol[:5]:
         log('   ' + '; '.join(f'{h}={x}' for h, x in zip(header, v)))
     notes += ['Q3: старый артикул всегда заменяю на новый, независимо от даты перехода: в «Прайс_история» есть только новые.',
