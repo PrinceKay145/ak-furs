@@ -333,6 +333,8 @@ def load_chats(path):
 # Regex detector, used to check the LLM and as its fallback.
 PRICE_RE = re.compile(r'\d[\d\s.,]*\s*(?:тыс|млн|₽|руб|р\.)|\b\d{1,3}(?:[ .\xa0]\d{3})+\b|\b\d{5,}\b|тысяч|миллион', re.I)
 INVITE_RE = re.compile(r'примерк|приезжа|подъех|приглаша|запиш|встреч|заезжа|приходи|жд[её]м вас', re.I)
+# Showroom address / opening hours: not an invitation, but notes report how the answer changes if it were.
+ADDRESS_RE = re.compile(r'находи(?:тся|мся)|адрес|метро|работаем|часы работы|ежедневно', re.I)
 
 
 def regex_labels(msgs):
@@ -454,6 +456,14 @@ def q4(chats, notes):
               f'Q4: проверка независимым regex-детектором: разметка расходится в {len(label_diff)} из '
               f'{len(chats) - len(failed)} чатов, итоговый ответ — в {len(verdict_diff)}'
               + (f' ({", ".join(verdict_diff)}).' if verdict_diff else '.')]
+    address = {cid: [i for i, (r, t) in enumerate(m, 1) if r == 'manager' and ADDRESS_RE.search(t)]
+               for cid, m in chats.items()}
+    alt = [cid for cid in chats if meeting_before_price(
+        chats[cid], {'price': llm[cid]['price'], 'invite': llm[cid]['invite'] + address[cid]})]
+    log(f'Q4: address/hours messages in {sum(map(bool, address.values()))} chats; '
+        f'counted as invites the answer would be {len(alt)} chats instead of {len(flagged)}')
+    notes.append(f'Q4: сообщение с адресом и часами работы шоурума приглашением не считаю; '
+                 f'если считать — ответ {len(alt)} чатов, а не {len(flagged)}.')
     if failed:
         notes.append(f'Q4: для {len(failed)} чатов LLM была недоступна, использован regex-детектор.')
     return {'q4_chats_meeting_before_price': flagged}
